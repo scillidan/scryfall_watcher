@@ -1,0 +1,5 @@
+# Add one downloaded card name or Scryfall URL ID per line.
+# Examples:
+# A Golden Opportunity
+# bbd-96-long-road-home
+# https://scryfall.com/card/bbd/96/long-road-home

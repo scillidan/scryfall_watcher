@@ -3,7 +3,8 @@
 
 Subcommands:
   track     Refresh/read Oracle Cards bulk data and record matching images.
-  download  Download pending images with atomic, resumable writes.
+  download  Download pending images or extra URL-ID lists.
+  favorite  Copy downloaded cards into deck-like folders from text lists.
   status    Print database and cache progress.
 
 Python 3.10+, standard library only. State lives in state.sqlite3; interrupting
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import email.utils
+import gzip
 import http.client
 import json
 import random
@@ -24,7 +26,9 @@ import sqlite3
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -36,8 +40,11 @@ if hasattr(sys.stdout, "reconfigure"):
 SEARCH_QUERY = "date>=soi (c:c or c>=w or c>=g) (r:uncommon or r:rare or r:mythic)"
 START_DATE = "2016-04-08"
 BULK_DATA_TYPE = "oracle_cards"
-BULK_INFO_URL = f"https://api.scryfall.com/bulk-data/{BULK_DATA_TYPE}"
-DEFAULT_OUTPUT_DIR = "scryfall_cards"
+BULK_INFO_URL = "https://api.scryfall.com/bulk-data"
+DEFAULT_DOWNLOAD_DIR = "_download"
+LEGACY_DOWNLOAD_DIR = "scryfall_cards"
+FAVORITE_OUTPUT_DIR = "_favorite"
+DEFAULT_FAVORITE_FILE = "favorite.txt"
 IMAGE_FORMAT = "png"
 ONLY_FRONT_FACE = True
 IMAGE_EXTENSIONS = {
@@ -183,11 +190,28 @@ CREATE TABLE IF NOT EXISTS images(
   image_format TEXT NOT NULL,
   url TEXT NOT NULL,
   local_name TEXT NOT NULL DEFAULT '',
+  source_path TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'new',  -- new | done | failed
   error TEXT NOT NULL DEFAULT '',
   UNIQUE(card_id, face_index, image_format)
 );
 CREATE INDEX IF NOT EXISTS idx_images_status ON images(status, id);
+CREATE TABLE IF NOT EXISTS extra_images(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  list_key TEXT NOT NULL,              -- output directory below _download/
+  entry TEXT NOT NULL,                 -- original URL ID from the text list
+  card_id TEXT NOT NULL DEFAULT '',
+  face_index INTEGER NOT NULL DEFAULT 0,
+  face_name TEXT NOT NULL DEFAULT '',
+  image_format TEXT NOT NULL,
+  url TEXT NOT NULL DEFAULT '',
+  local_name TEXT NOT NULL DEFAULT '',
+  source_path TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'new',  -- new | done | failed
+  error TEXT NOT NULL DEFAULT '',
+  UNIQUE(list_key, entry, face_index, image_format)
+);
+CREATE INDEX IF NOT EXISTS idx_extra_status ON extra_images(status, id);
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 
@@ -198,6 +222,10 @@ class DB:
         self.conn = sqlite3.connect(base / "state.sqlite3")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        # Databases created by version 1.0 did not record the actual image path.
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(images)")}
+        if "source_path" not in columns:
+            self.conn.execute("ALTER TABLE images ADD COLUMN source_path TEXT NOT NULL DEFAULT ''")
 
     def __enter__(self) -> "DB":
         return self
@@ -223,33 +251,69 @@ class DB:
 # ------------------------------------------------------------------- track ----
 
 
-def load_bulk(path: Path) -> list[dict[str, Any]]:
+def iter_bulk(path: Path) -> Iterator[dict[str, Any]]:
+    """Stream current JSONL.GZ bulk files or read a legacy JSON-array cache."""
     log(f"loading bulk data: {path}")
     try:
-        with path.open("r", encoding="utf-8") as source:
-            data = json.load(source)
-    except (OSError, json.JSONDecodeError) as error:
+        if path.suffix.lower() == ".gz":
+            with gzip.open(path, "rt", encoding="utf-8") as source:
+                for line_number, line in enumerate(source, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        card = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise RuntimeError(f"invalid JSONL at {path}:{line_number}: {error}") from error
+                    if not isinstance(card, dict):
+                        raise RuntimeError(f"expected a card object at {path}:{line_number}")
+                    yield card
+        else:
+            with path.open("r", encoding="utf-8") as source:
+                data = json.load(source)
+            if not isinstance(data, list):
+                raise RuntimeError(f"legacy bulk data is not a JSON array: {path}")
+            for card in data:
+                if isinstance(card, dict):
+                    yield card
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"cannot read bulk data {path}: {error}") from error
-    if not isinstance(data, list):
-        raise RuntimeError(f"bulk data is not a JSON array: {path}")
-    return data
 
 
-def prepare_bulk(db: DB, base: Path, update: bool, offline: bool) -> tuple[list[dict[str, Any]], Path]:
+def prepare_bulk(db: DB, base: Path, update: bool, offline: bool) -> tuple[Path, dict[str, str]]:
     cache = base / "cache"
     cache.mkdir(parents=True, exist_ok=True)
-    bulk_path = cache / "bulk_data.json"
+    legacy_path = cache / "bulk_data.json"
+    jsonl_path = cache / "bulk_data.jsonl.gz"
 
     if offline:
+        bulk_path = jsonl_path if jsonl_path.exists() else legacy_path
         if not bulk_path.exists():
-            raise RuntimeError("offline mode requires cache/bulk_data.json; run track online first")
-        return load_bulk(bulk_path), bulk_path
+            raise RuntimeError(
+                "offline mode requires cache/bulk_data.jsonl.gz or cache/bulk_data.json; "
+                "run track online first"
+            )
+        return bulk_path, {}
 
-    info = fetch_json(BULK_INFO_URL)
-    download_uri = info.get("download_uri", "")
-    updated_at = info.get("updated_at", "")
+    response = fetch_json(BULK_INFO_URL)
+    if response.get("object") == "error":
+        raise RuntimeError(f"Scryfall bulk-data error: {response.get('details') or response}")
+    items = response.get("data")
+    if isinstance(items, list):
+        info = next((item for item in items if item.get("type") == BULK_DATA_TYPE), None)
+    elif response.get("type") == BULK_DATA_TYPE:
+        info = response  # Also accept a single bulk_data object for compatibility.
+    else:
+        info = None
+    if not isinstance(info, dict):
+        raise RuntimeError(f"Scryfall bulk-data response has no {BULK_DATA_TYPE} entry")
+
+    jsonl_uri = str(info.get("jsonl_download_uri") or "")
+    legacy_uri = str(info.get("download_uri") or "")
+    download_uri = jsonl_uri or legacy_uri
+    updated_at = str(info.get("updated_at") or "")
     if not download_uri:
-        raise RuntimeError("bulk-data response has no download_uri")
+        raise RuntimeError(f"Scryfall {BULK_DATA_TYPE} entry has no supported download URI: {info}")
+    bulk_path = jsonl_path if jsonl_uri else legacy_path
     version = f"{updated_at}|{download_uri}"
     current = bulk_path.exists() and not update and db.get_kv("bulk_version") == version
 
@@ -260,13 +324,11 @@ def prepare_bulk(db: DB, base: Path, update: bool, offline: bool) -> tuple[list[
         size_text = f", {int(size) / 1e6:.1f} MB" if isinstance(size, int) else ""
         log(f"downloading {BULK_DATA_TYPE} bulk data ({updated_at or 'unknown'}{size_text})")
         download_file(download_uri, bulk_path)
-
-    cards = load_bulk(bulk_path)  # validate before recording this version
-    db.set_kv("bulk_version", version)
-    db.set_kv("bulk_updated_at", str(updated_at))
-    db.set_kv("bulk_download_uri", str(download_uri))
-    db.commit()
-    return cards, bulk_path
+    return bulk_path, {
+        "version": version,
+        "updated_at": updated_at,
+        "download_uri": download_uri,
+    }
 
 
 def matches_filter(card: dict[str, Any]) -> bool:
@@ -316,12 +378,82 @@ def image_filename(
     return f"{face}_{set_code}_{number}{suffix}.{extension}"
 
 
+def upsert_card(db: DB, card: dict[str, Any]) -> str:
+    card_id = str(card.get("id") or "")
+    if not card_id:
+        raise RuntimeError("card object has no id")
+    db.conn.execute(
+        "INSERT INTO cards(id,oracle_id,name,released_at,rarity,set_code,"
+        "collector_number,scryfall_uri,layout) VALUES(?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(id) DO UPDATE SET oracle_id=excluded.oracle_id,"
+        "name=excluded.name,released_at=excluded.released_at,rarity=excluded.rarity,"
+        "set_code=excluded.set_code,collector_number=excluded.collector_number,"
+        "scryfall_uri=excluded.scryfall_uri,layout=excluded.layout",
+        (
+            card_id,
+            str(card.get("oracle_id") or ""),
+            str(card.get("name") or "unknown"),
+            str(card.get("released_at") or ""),
+            str(card.get("rarity") or ""),
+            str(card.get("set") or ""),
+            str(card.get("collector_number") or ""),
+            str(card.get("scryfall_uri") or ""),
+            str(card.get("layout") or ""),
+        ),
+    )
+    return card_id
+
+
+def input_path(base: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else base / path
+
+
+def read_entries(path: Path) -> list[str]:
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as error:
+        raise RuntimeError(f"cannot read list {path}: {error}") from error
+    return [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+
+
+def collect_lists(
+    base: Path, files: list[str] | None, directories: list[str] | None
+) -> list[tuple[Path, str]]:
+    """Return (text file, safe relative output key) pairs in stable order."""
+    collected: list[tuple[Path, str]] = []
+    for value in files or []:
+        path = input_path(base, value)
+        if not path.is_file():
+            raise RuntimeError(f"list file not found: {path}")
+        collected.append((path, safe_component(path.stem)))
+    for value in directories or []:
+        root = input_path(base, value)
+        if not root.is_dir():
+            raise RuntimeError(f"list directory not found: {root}")
+        for path in sorted(root.rglob("*.txt")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).with_suffix("")
+            parts = [safe_component(root.name)]
+            parts.extend(safe_component(part) for part in relative.parts)
+            collected.append((path, "/".join(parts)))
+    unique: list[tuple[Path, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for path, key in collected:
+        identity = (str(path.resolve()), key)
+        if identity not in seen:
+            seen.add(identity)
+            unique.append((path, key))
+    return unique
+
+
 def cmd_track(db: DB, args: argparse.Namespace) -> None:
     if args.offline and args.update:
         raise SystemExit("--offline and --update cannot be used together")
     base = Path(args.base)
-    all_cards, bulk_path = prepare_bulk(db, base, args.update, args.offline)
-    log(f"{len(all_cards)} cards in {bulk_path.name}")
+    bulk_path, bulk_meta = prepare_bulk(db, base, args.update, args.offline)
+    all_cards = iter_bulk(bulk_path)
     log(f"filter: {SEARCH_QUERY}")
     log(f"image format: {args.image_format}; only front face: {not args.all_faces}")
 
@@ -336,25 +468,7 @@ def cmd_track(db: DB, args: argparse.Namespace) -> None:
         exists = db.conn.execute("SELECT 1 FROM cards WHERE id=?", (card_id,)).fetchone()
         if not exists:
             new_cards += 1
-        db.conn.execute(
-            "INSERT INTO cards(id,oracle_id,name,released_at,rarity,set_code,"
-            "collector_number,scryfall_uri,layout) VALUES(?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET oracle_id=excluded.oracle_id,"
-            "name=excluded.name,released_at=excluded.released_at,rarity=excluded.rarity,"
-            "set_code=excluded.set_code,collector_number=excluded.collector_number,"
-            "scryfall_uri=excluded.scryfall_uri,layout=excluded.layout",
-            (
-                card_id,
-                str(card.get("oracle_id") or ""),
-                str(card.get("name") or "unknown"),
-                str(card.get("released_at") or ""),
-                str(card.get("rarity") or ""),
-                str(card.get("set") or ""),
-                str(card.get("collector_number") or ""),
-                str(card.get("scryfall_uri") or ""),
-                str(card.get("layout") or ""),
-            ),
-        )
+        upsert_card(db, card)
         specs = image_specs(card, args.image_format, not args.all_faces)
         if not specs:
             without_images += 1
@@ -384,6 +498,10 @@ def cmd_track(db: DB, args: argparse.Namespace) -> None:
             log(f"--max-cards {args.max_cards} reached")
             break
 
+    if bulk_meta:
+        db.set_kv("bulk_version", bulk_meta["version"])
+        db.set_kv("bulk_updated_at", bulk_meta["updated_at"])
+        db.set_kv("bulk_download_uri", bulk_meta["download_uri"])
     db.set_kv("image_format", args.image_format)
     db.set_kv("only_front_face", str(not args.all_faces))
     db.commit()
@@ -396,56 +514,308 @@ def cmd_track(db: DB, args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------- download ----
 
 
-def cmd_download(db: DB, args: argparse.Namespace) -> None:
-    base = Path(args.base)
-    output = Path(args.output) if args.output else base / DEFAULT_OUTPUT_DIR
-    output.mkdir(parents=True, exist_ok=True)
-    rows = db.conn.execute(
-        "SELECT id,url,local_name FROM images WHERE status IN ('new','failed') "
-        "ORDER BY id" + (f" LIMIT {args.limit}" if args.limit else "")
-    ).fetchall()
-    log(f"{len(rows)} images pending; output: {output}")
-    deadline = time.monotonic() + args.budget_minutes * 60 if args.budget_minutes else None
-    done = failed = 0
+def parse_url_id(value: str) -> tuple[str, str] | None:
+    """Parse set-number-name, set/number/name, or a Scryfall card URL."""
+    text = value.strip()
+    parts: list[str]
+    if text.startswith(("https://", "http://")):
+        parsed = urllib.parse.urlparse(text)
+        parts = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+        if "card" not in parts:
+            return None
+        parts = parts[parts.index("card") + 1 :]
+    elif "/" in text:
+        parts = [part for part in text.strip("/").split("/") if part]
+    else:
+        parts = text.split("-")
+        # A bare card name containing spaces must not be mistaken for a URL ID.
+        if len(parts) < 2 or (len(parts) == 2 and not parts[1].isdigit()):
+            return None
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0], parts[1]
 
-    for image_id, url, local_name in rows:
+
+def fetch_card_by_url_id(value: str) -> dict[str, Any]:
+    parsed = parse_url_id(value)
+    if not parsed:
+        raise RuntimeError(f"invalid Scryfall URL ID: {value}")
+    set_code, number = (urllib.parse.quote(part, safe="") for part in parsed)
+    card = fetch_json(f"https://api.scryfall.com/cards/{set_code}/{number}")
+    if card.get("object") == "error":
+        raise RuntimeError(str(card.get("details") or f"card not found: {value}"))
+    return card
+
+
+def record_extra_error(db: DB, list_key: str, entry: str, image_format: str, error: Exception) -> None:
+    db.conn.execute(
+        "INSERT INTO extra_images(list_key,entry,image_format,status,error) VALUES(?,?,?,'failed',?) "
+        "ON CONFLICT(list_key,entry,face_index,image_format) DO UPDATE SET "
+        "status='failed',error=excluded.error",
+        (list_key, entry, image_format, str(error)[:400]),
+    )
+    db.commit()
+    log(f"FAILED to resolve {entry}: {error}")
+
+
+def register_extra_lists(
+    db: DB, lists: list[tuple[Path, str]], download_root: Path
+) -> list[str]:
+    image_format = db.get_kv("image_format") or IMAGE_FORMAT
+    keys: list[str] = []
+    for path, list_key in lists:
+        keys.append(list_key)
+        log(f"include list: {path} -> {download_root / Path(*list_key.split('/'))}")
+        for entry in read_entries(path):
+            old = db.conn.execute(
+                "SELECT url FROM extra_images WHERE list_key=? AND entry=? "
+                "AND face_index=0 AND image_format=?",
+                (list_key, entry, image_format),
+            ).fetchone()
+            if old and old[0]:
+                continue  # Resolution is cached; only the file download needs retrying.
+            try:
+                log(f"resolve {entry}")
+                card = fetch_card_by_url_id(entry)
+                card_id = upsert_card(db, card)
+                specs = image_specs(card, image_format, only_front=True)
+                if not specs:
+                    raise RuntimeError(f"no {image_format} front-face image for {entry}")
+                face_index, face_name, url, suffix = specs[0]
+                local_name = image_filename(card, face_name, suffix, image_format)
+                db.conn.execute(
+                    "INSERT INTO extra_images(list_key,entry,card_id,face_index,face_name,"
+                    "image_format,url,local_name) VALUES(?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(list_key,entry,face_index,image_format) DO UPDATE SET "
+                    "card_id=excluded.card_id,face_name=excluded.face_name,url=excluded.url,"
+                    "local_name=excluded.local_name,source_path=CASE WHEN "
+                    "extra_images.url=excluded.url THEN extra_images.source_path ELSE '' END,"
+                    "status=CASE WHEN extra_images.status='done' AND extra_images.url=excluded.url "
+                    "THEN 'done' ELSE 'new' END,error=''",
+                    (list_key, entry, card_id, face_index, face_name, image_format, url, local_name),
+                )
+                db.commit()
+            except Exception as error:
+                record_extra_error(db, list_key, entry, image_format, error)
+    return keys
+
+
+def path_owner_urls(db: DB, table: str, image_id: int, destination: Path) -> set[str]:
+    """Return URLs already associated with a path by either download queue."""
+    owners: set[str] = set()
+    path = str(destination.resolve())
+    for owner_table in ("images", "extra_images"):
+        if owner_table == table:
+            rows = db.conn.execute(
+                f"SELECT url FROM {owner_table} WHERE source_path=? AND id<>?", (path, image_id)
+            )
+        else:
+            rows = db.conn.execute(f"SELECT url FROM {owner_table} WHERE source_path=?", (path,))
+        owners.update(row[0] for row in rows if row[0])
+    return owners
+
+
+def available_destination(db: DB, table: str, image_id: int, url: str, original: Path) -> Path:
+    """Reuse an identical file, or allocate -2/-3 names for different files."""
+    candidate = original
+    number = 2
+    resolving_collision = False
+    while True:
+        owners = path_owner_urls(db, table, image_id, candidate)
+        if url in owners:
+            return candidate
+        if owners or (candidate.exists() and resolving_collision):
+            # Another source owns this name. An unowned file later in a -2/-3
+            # sequence is also treated as a collision rather than overwritten.
+            candidate = original.with_name(f"{original.stem}-{number}{original.suffix}")
+            number += 1
+            resolving_collision = True
+            continue
+        # An existing, unowned original filename is considered an old download
+        # of the current task. This preserves compatibility with the old script.
+        return candidate
+
+
+def perform_downloads(
+    db: DB, table: str, tasks: list[tuple[int, str, str, Path]], deadline: float | None
+) -> None:
+    """Download rows prepared by either the regular or extra-list queue."""
+    done = failed = 0
+    for image_id, url, local_name, destination in tasks:
         if deadline is not None and time.monotonic() >= deadline:
             log("time budget exhausted; rerun the same command to resume")
             break
-        if not local_name:
-            message = "empty local_name; run track again"
-            db.conn.execute(
-                "UPDATE images SET status='failed',error=? WHERE id=?", (message, image_id)
-            )
-            db.commit()
-            failed += 1
-            continue
-        destination = output / local_name
-        if destination.exists() and destination.stat().st_size > 0:
-            db.conn.execute(
-                "UPDATE images SET status='done',error='' WHERE id=?", (image_id,)
-            )
-            db.commit()
-            done += 1
-            log(f"exists: {local_name}")
-            continue
         try:
-            log(f"GET {local_name}")
-            download_file(url, destination)
+            destination = available_destination(db, table, image_id, url, destination)
+            if destination.name != local_name:
+                log(f"name collision: {local_name} -> {destination.name}")
+                db.conn.execute(
+                    f"UPDATE {table} SET local_name=? WHERE id=?", (destination.name, image_id)
+                )
+                db.commit()
+                local_name = destination.name
+            if destination.exists() and destination.stat().st_size > 0:
+                log(f"exists: {destination}")
+            else:
+                log(f"GET {destination}")
+                download_file(url, destination)
             db.conn.execute(
-                "UPDATE images SET status='done',error='' WHERE id=?", (image_id,)
+                f"UPDATE {table} SET status='done',error='',source_path=? WHERE id=?",
+                (str(destination.resolve()), image_id),
             )
             db.commit()
             done += 1
         except Exception as error:
             log(f"FAILED {local_name}: {error}")
             db.conn.execute(
-                "UPDATE images SET status='failed',error=? WHERE id=?",
+                f"UPDATE {table} SET status='failed',error=? WHERE id=?",
                 (str(error)[:400], image_id),
             )
             db.commit()
             failed += 1
     log(f"download done: {done} ok/existing, {failed} failed")
+
+
+def cmd_download(db: DB, args: argparse.Namespace) -> None:
+    base = Path(args.base)
+    deadline = time.monotonic() + args.budget_minutes * 60 if args.budget_minutes else None
+    download_root = (
+        input_path(base, args.download_dir)
+        if args.download_dir
+        else base / DEFAULT_DOWNLOAD_DIR
+    )
+    download_root.mkdir(parents=True, exist_ok=True)
+    use_extra = bool(args.include_files or args.include_directories)
+
+    if use_extra:
+        lists = collect_lists(base, args.include_files, args.include_directories)
+        keys = register_extra_lists(db, lists, download_root)
+        if not keys:
+            log("no include lists supplied")
+            return
+        placeholders = ",".join("?" for _ in keys)
+        sql = (
+            "SELECT id,list_key,url,local_name FROM extra_images "
+            "WHERE status IN ('new','failed') AND url!='' AND local_name!='' "
+            f"AND list_key IN ({placeholders}) ORDER BY id"
+        )
+        params: list[Any] = list(keys)
+        if args.limit:
+            sql += " LIMIT ?"
+            params.append(args.limit)
+        rows = db.conn.execute(sql, params).fetchall()
+        tasks = [
+            (
+                image_id,
+                url,
+                local_name,
+                download_root / Path(*list_key.split("/")) / local_name,
+            )
+            for image_id, list_key, url, local_name in rows
+        ]
+        log(f"{len(tasks)} extra images pending; root: {download_root}")
+        perform_downloads(db, "extra_images", tasks, deadline)
+        return
+
+    sql = "SELECT id,url,local_name FROM images WHERE status IN ('new','failed') ORDER BY id"
+    if args.limit:
+        sql += f" LIMIT {args.limit}"
+    rows = db.conn.execute(sql).fetchall()
+    tasks = [
+        (image_id, url, local_name, download_root / local_name)
+        for image_id, url, local_name in rows
+    ]
+    log(f"{len(tasks)} images pending; root: {download_root}")
+    perform_downloads(db, "images", tasks, deadline)
+
+
+# ---------------------------------------------------------------- favorite ----
+
+
+def favorite_card_ids(db: DB, entry: str) -> list[str]:
+    parsed = parse_url_id(entry)
+    if parsed:
+        rows = db.conn.execute(
+            "SELECT id FROM cards WHERE set_code=? COLLATE NOCASE "
+            "AND collector_number=? COLLATE NOCASE",
+            parsed,
+        ).fetchall()
+    else:
+        rows = db.conn.execute(
+            "SELECT id FROM cards WHERE name=? COLLATE NOCASE "
+            "UNION SELECT card_id FROM images WHERE face_name=? COLLATE NOCASE "
+            "UNION SELECT card_id FROM extra_images WHERE face_name=? COLLATE NOCASE",
+            (entry, entry, entry),
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
+def favorite_sources(db: DB, base: Path, card_id: str) -> list[tuple[str, Path]]:
+    sources: list[tuple[str, Path]] = []
+    rows = db.conn.execute(
+        "SELECT face_name,local_name,source_path FROM images "
+        "WHERE card_id=? AND status='done' ORDER BY face_index,id",
+        (card_id,),
+    ).fetchall()
+    for _face_name, local_name, source_path in rows:
+        candidates = [
+            Path(source_path) if source_path else base / DEFAULT_DOWNLOAD_DIR / local_name,
+            base / DEFAULT_DOWNLOAD_DIR / local_name,
+            base / LEGACY_DOWNLOAD_DIR / local_name,
+        ]
+        source = next((path for path in candidates if path.is_file()), candidates[0])
+        sources.append((local_name, source))
+    rows = db.conn.execute(
+        "SELECT list_key,local_name,source_path FROM extra_images "
+        "WHERE card_id=? AND status='done' ORDER BY face_index,id",
+        (card_id,),
+    ).fetchall()
+    for list_key, local_name, source_path in rows:
+        fallback = base / DEFAULT_DOWNLOAD_DIR / Path(*list_key.split("/")) / local_name
+        source = Path(source_path) if source_path else fallback
+        if not source.is_file():
+            source = fallback
+        sources.append((local_name, source))
+    return sources
+
+
+def cmd_favorite(db: DB, args: argparse.Namespace) -> None:
+    base = Path(args.base)
+    files = args.files
+    if not files and not args.directories:
+        files = [DEFAULT_FAVORITE_FILE]
+    lists = collect_lists(base, files, args.directories)
+    copied = existing = missing = 0
+    for path, list_key in lists:
+        target_dir = base / FAVORITE_OUTPUT_DIR / Path(*list_key.split("/"))
+        target_dir.mkdir(parents=True, exist_ok=True)
+        log(f"favorite list: {path} -> {target_dir}")
+        copied_names: set[str] = set()
+        for entry in read_entries(path):
+            card_ids = favorite_card_ids(db, entry)
+            found = False
+            for card_id in card_ids:
+                for local_name, source in favorite_sources(db, base, card_id):
+                    if local_name in copied_names:
+                        found = True
+                        continue
+                    destination = target_dir / local_name
+                    if destination.exists():
+                        copied_names.add(local_name)
+                        existing += 1
+                        found = True
+                        continue
+                    if not source.is_file():
+                        continue
+                    shutil.copy2(source, destination)
+                    copied_names.add(local_name)
+                    copied += 1
+                    found = True
+                    log(f"copy {source} -> {destination}")
+            if not found:
+                missing += 1
+                log(f"NOT DOWNLOADED: {entry}")
+    log(f"favorite done: {copied} copied, {existing} existing, {missing} unavailable")
 
 
 # ------------------------------------------------------------------ status ----
@@ -458,6 +828,9 @@ def cmd_status(db: DB, args: argparse.Namespace) -> None:
         ("images done", "SELECT COUNT(*) FROM images WHERE status='done'"),
         ("images new", "SELECT COUNT(*) FROM images WHERE status='new'"),
         ("images failed", "SELECT COUNT(*) FROM images WHERE status='failed'"),
+        ("extra images", "SELECT COUNT(*) FROM extra_images"),
+        ("extra done", "SELECT COUNT(*) FROM extra_images WHERE status='done'"),
+        ("extra failed", "SELECT COUNT(*) FROM extra_images WHERE status='failed'"),
     ]:
         print(f"{label:>14}: {db.conn.execute(sql).fetchone()[0]}")
     print(f"{'bulk updated':>14}: {db.get_kv('bulk_updated_at') or 'unknown'}")
@@ -502,15 +875,52 @@ def main() -> None:
         help="stop cleanly after this many minutes (resumable)",
     )
     download.add_argument(
-        "--output",
+        "--download-dir",
         default=None,
-        help=f"image directory (default: BASE/{DEFAULT_OUTPUT_DIR})",
+        help=f"root for regular and included downloads (default: BASE/{DEFAULT_DOWNLOAD_DIR})",
+    )
+    download.add_argument(
+        "--include-file",
+        dest="include_files",
+        nargs="+",
+        metavar="FILE",
+        help="download URL IDs from text files into DOWNLOAD_DIR/<file>/",
+    )
+    download.add_argument(
+        "--include-dir",
+        dest="include_directories",
+        nargs="+",
+        metavar="DIR",
+        help="read .txt lists recursively and preserve their directory structure",
+    )
+
+    favorite = sub.add_parser("favorite", help="copy downloaded images into favorite/deck folders")
+    favorite.add_argument(
+        "--file",
+        "--files",
+        dest="files",
+        nargs="+",
+        metavar="FILE",
+        help=f"favorite lists (default: BASE/{DEFAULT_FAVORITE_FILE})",
+    )
+    favorite.add_argument(
+        "--dir",
+        "--dirs",
+        dest="directories",
+        nargs="+",
+        metavar="DIR",
+        help="read favorite .txt lists recursively and preserve their structure",
     )
 
     sub.add_parser("status", help="print database counts and cache version")
     args = parser.parse_args()
     with DB(Path(args.base)) as db:
-        {"track": cmd_track, "download": cmd_download, "status": cmd_status}[args.cmd](db, args)
+        {
+            "track": cmd_track,
+            "download": cmd_download,
+            "favorite": cmd_favorite,
+            "status": cmd_status,
+        }[args.cmd](db, args)
 
 
 if __name__ == "__main__":
